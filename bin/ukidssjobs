@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import numpy as np
+import warnings
+from astropy.io import fits
+from astropy.utils.exceptions import AstropyWarning
+from astropy.table import Table,vstack
+import time
+import shutil
+import re
+import subprocess
+from glob import glob
+from datetime import datetime
+import logging
+import socket
+from datetime import datetime
+from argparse import ArgumentParser
+from dlnpyutils import utils as dln,slurm
+from nsc import utils
+from nsc.nsc_instcal_measure import Exposure
+from nsc import slurm as slrm,utils
+
+
+
+def taccifyname(filename):
+    """ Modify mss filenames for tacc"""
+    imagedir = '/scratch1/09970/dnidever/nsc/instcal/v4/images'
+    if filename[:9]=='/net/mss1':
+        base = os.path.basename(filename)
+        if base[:3]=='c4d':
+            instrument = base[:3] 
+            night = '20'+base[4:10]
+        else:
+            instrument = 'c4d'   # assume all decam for now
+            head = fits.getheader(filename,0)
+            dateobs = head['DATE-OBS']
+            night = dateobs[:4]+dateobs[5:7]+dateobs[8:10]
+        newfilename = os.path.join(imagedir,instrument,night[:4],night,base)
+    else:
+        newfilename = filename
+    return newfilename        
+
+if __name__ == "__main__":
+    # Run lots of NSC jobs
+    parser = ArgumentParser(description='Run NSC jobs')
+    parser.add_argument('stage', type=str, nargs=1, help='Stage (download, measure, calibrate or combine)')
+    parser.add_argument('inputfile', type=str, nargs=1, help='Input list filename')
+    parser.add_argument('version', type=str, nargs=1, help='NSC version')
+    parser.add_argument('--host',type=str,nargs=1,default="None",help='hostname, default "None", other options supported are "cca","tempest_katie","tempest_group","gp09/7","tacc"')
+    parser.add_argument('--partition',type=str,nargs=1,default='',help='what TACC partition to use')
+    parser.add_argument('--walltime',type=str,nargs=1,default='2-00:00:00',help='Slurm job runtime')
+    parser.add_argument('--maxtasks',type=int,nargs=1,default=20000,help='Maximum number of tasks to run')
+    parser.add_argument('--nodes',type=int,nargs=1,default=0,help='Number of nodes')
+    parser.add_argument('--ppn',type=int,nargs=1,default=0,help='Processes per node')
+    parser.add_argument('--stagger',type=int,nargs=1,default=60,help='Stagger time')
+    parser.add_argument('--healpix',action='store_true',help='Do calibration in healpix mode')
+    parser.add_argument('--delete',action='store_true',help='Delete image files at end')
+    parser.add_argument('--nowait',action='store_true',help='Do not wait for files to be downloaded')
+    parser.add_argument('-r','--redo', action='store_true', help='Redo exposures that were previously processed')
+    args = parser.parse_args()
+
+    # Inputs                                        
+    stage = args.stage[0].lower()
+    inputfile = args.inputfile[0]
+    version = args.version[0]                # NSC version, like "v4", default "None"
+    if version=="None": version = None
+    host = str(args.host[0])                 # hostname of server, default "None"                  
+    if host=="None": host = None
+    if isinstance(args.partition,list):
+        partition = args.partition[0]
+    else:
+        partition = args.partition
+    if isinstance(args.walltime,list):
+        walltime = args.walltime[0]
+    else:
+        walltime = args.walltime
+    if isinstance(args.maxtasks,list):       # maximum number of tasks to run from input list
+        maxtasks = args.maxtasks[0]
+    else:
+        maxtasks = args.maxtasks
+    if isinstance(args.nodes,list):
+        nodes = args.nodes[0]
+    else:
+        nodes = args.nodes
+    if nodes==0: nodes=None
+    if isinstance(args.ppn,list):
+        ppn = args.ppn[0]
+    else:
+        ppn = args.ppn
+    if ppn==0: ppn=None
+    if isinstance(args.stagger,list):
+        stagger = args.stagger[0]
+    else:
+        stagger = args.stagger
+    healpix = args.healpix
+    delete = args.delete
+    nowait = args.nowait
+    redo = args.redo                         # if called, redo = True
+
+    # Default partitions
+    if partition=='':
+        if host=='tacc':
+            partition = 'small'
+        elif host.lower()[:7]=='tempest':
+            partition = 'priority'
+    # Account
+    if host=='tacc':
+        account = None
+    elif host.lower()[:7]=='tempest':
+        account = 'priority-davidnidever'
+
+    print('Input Parameters:')
+    print('-----------------')
+    print('stage =',stage,)
+    print('inputfile =',inputfile)
+    print('version =',version)
+    print('host =',host)
+    print('maxtasks =',maxtasks)
+    if nodes is not None:
+        print('nodes =',nodes)
+    if ppn is not None:
+        print('ppn =',ppn)
+    print('stagger =',stagger)
+    print('healpix =',healpix)
+    print('delete =',delete)
+    print('nowait =',nowait)
+    print('redo =',redo)
+
+    # Check that the input file exists
+    if os.path.exists(inputfile)==False:
+        print(inputfile,'NOT FOUND')
+        sys.exit()
+
+    # Load the input lines
+    if inputfile.endswith('.fits') or inputfile.endswith('.fits.gz'):
+        print('Loading',inputfile,' FITS file')
+        inputdata = Table.read(inputfile)
+    else:
+        print('Loading',inputfile,' ASCII file')
+        inputdata = utils.readlines(inputfile)
+    print(len(inputdata),'inputs')
+
+    # Make sure the filename columns are long enough
+    if 'fluxfile' in inputdata.colnames:
+        inputdata['fluxfile'] = inputdata['fluxfile'].astype((str,150))
+        inputdata['wtfile'] = inputdata['wtfile'].astype((str,150))
+        inputdata['maskfile'] = inputdata['maskfile'].astype((str,150))
+
+    # Processes per node
+    if ppn is None:
+        ppn = 64
+        if host=='tacc':
+            ppn = 28
+            if stage=='calibrate' and healpix:
+                ppn = 10
+
+    # Get NSC directories                                                                                     
+    basedir, tmpdir = utils.getnscdirs(version,host)
+    print("Working in basedir,tmpdir = ",basedir,tmpdir)
+    # Make sure the directories exist                                                                         
+    if not os.path.exists(basedir):
+        os.makedirs(basedir)
+    if not os.path.exists(tmpdir):
+        os.makedirs(tmpdir)
+
+    if 'tempest' in host:
+        download_dir = os.path.join(basedir,'download')
+        
+    dt = [('cmd',str,1000),('name',str,100),('output',str,300),
+          ('outfile',str,300),('errfile',str,300),('dir',str,300)] 
+    logtime = datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+    ##############################################################################
+    # Download
+    #============
+    if stage=='download':
+        script = 'nsc_download'
+        label ='download'
+        cmd = script+' '+os.path.abspath(inputfile)+' '+version+' --host '+host+' --maximages '+str(maxtasks)
+        logfile = os.path.join(basedir,'download','download.'+logtime+'.log')
+        if os.path.exists(os.path.dirname(logfile))==False:
+            os.makedirs(os.path.dirname(logfile))
+        # Put information in the tasks table
+        tasks = Table(np.zeros(1,dtype=np.dtype(dt)))
+        tasks['cmd'][0] = cmd
+        tasks['name'][0] = 'download.'+logtime
+        tasks['outfile'][0] = logfile 
+        tasks['errfile'][0] = logfile.replace('.log','.err')
+        tasks['dir'][0] = os.path.dirname(logfile)
+        nodes = 1
+        
+    ##############################################################################
+    # Measurement
+    #============
+    elif stage=='meas' or stage=='measure' or stage=='measurement':
+        script = 'nsc_instcal_measure'
+        label = 'measure'
+        if isinstance(inputdata,Table)==False:
+            inputlist = inputdata.copy()
+            dtinp = [('fluxfile',str,1000),('wtfile',str,1000),('maskfile',str,1000)]
+            inputdata = Table(np.zeros(len(inputlist),dtype=np.dtype(dtinp)))
+            for i in range(len(inputlist)):
+                ff,wt,mf = inputlist[i].split()
+                inputdata['fluxfile'][i] = ff
+                inputdata['wtfile'][i] = wt
+                inputdata['maskfile'][i] = mf
+
+        # Fix image filenames on TACC and tempest
+        if host=='tacc' or 'tempest' in host:
+            print('Fixing filenames')
+            imlistfile = basedir+'images/allimages.lst'
+            #if os.path.exists(imlistfile)==False or (os.path.getctime(imlistfile) < (datetime.now().timestamp()-7200)):
+            if os.path.exists(imlistfile)==False:
+                print('Remaking image list')
+                if os.path.exists(imlistfile):
+                    os.remove(imlistfile)
+                curdir = os.getcwd()
+                os.chdir(os.path.dirname(imlistfile))
+                ret = subprocess.call('lfind fits.fz > allimages.lst',shell=True)
+                os.chdir(curdir)
+                nlines = utils.numlines(imlistfile)
+                print(nlines,' files in image list')
+            imlines = utils.readlines(basedir+'images/allimages.lst')
+            imlines = [basedir+'images/'+f[1:] for f in imlines]  # make absolute
+            imlines = np.array(imlines)
+            imbase = np.array([os.path.basename(f) for f in imlines])
+            fluxfiles = inputdata['fluxfile']
+            fluxbase = np.array([os.path.basename(f) for f in fluxfiles])
+            _,ind1,ind2 = np.intersect1d(fluxbase,imbase,return_indices=True)
+            if len(ind1)>0:
+                print(len(ind1),' fluxfile names')
+                inputdata['fluxfile'][ind1] = imlines[ind2]
+            wtfiles = inputdata['wtfile']
+            wtbase = np.array([os.path.basename(w) for w in wtfiles])
+            _,ind1,ind2 = np.intersect1d(wtbase,imbase,return_indices=True)
+            if len(ind1)>0:
+                print(len(ind1),' wtfile names')
+                inputdata['wtfile'][ind1] = imlines[ind2]
+            maskfiles = inputdata['maskfile']
+            maskbase = np.array([os.path.basename(m) for m in maskfiles])
+            _,ind1,ind2 = np.intersect1d(maskbase,imbase,return_indices=True)
+            if len(ind1)>0:
+                print(len(ind1),' maskfile names')
+                inputdata['maskfile'][ind1] = imlines[ind2]
+                
+        # Check previously submitted tasks lists
+        print('Checking previously submitted tasks lists')
+        tasklist = glob(os.path.join(basedir,'lists',label+'_*_tasks.fits'))
+        prevtasks = None        
+        if len(tasklist)>0:
+            ntotprev = 0
+            for tf in tasklist:
+                head = fits.getheader(tf,1)
+                ntotprev += head['naxis2']
+            ptasks1 = Table.read(tasklist[0])
+            prevtasks = Table(np.zeros(ntotprev,dtype=ptasks1.dtype))
+            count = 0
+            for tf in tasklist:
+                print('Loading ',tf)
+                ptasks = Table.read(tf)
+                prevtasks[count:count+len(ptasks)] = ptasks
+                count += len(ptasks)
+        # Some previous lists
+        if prevtasks is not None:
+            # Get unique exposures
+            _,ui = np.unique(prevtasks['name'],return_index=True)
+            prevtasks = prevtasks[ui]
+            # Trim string column lengths
+            for c in prevtasks.colnames:
+                prevtasks[c] = prevtasks[c].tolist()
+            # Remove any previously submitted exposures
+            inpbases = [os.path.basename(r['fluxfile']).replace('.fits.fz','') for r in inputdata]
+            inpbases = np.array(inpbases).astype(str)
+            _,ind1,ind2 = np.intersect1d(prevtasks['name'],inpbases,return_indices=True)
+            if len(ind1)>0:
+                print(len(ind1),' previously submitted exposures to remove')
+                inputdata.remove_rows(ind2)
+
+        # Loop over input data and populate the tasks list
+        tasks = Table(np.zeros(np.minimum(len(inputdata),maxtasks),dtype=np.dtype(dt)))
+        cnt = 0
+        for i in range(len(inputdata)):
+            fluxfile = inputdata['fluxfile'][i]
+            wtfile = inputdata['wtfile'][i]
+            maskfile = inputdata['maskfile'][i]
+            base = os.path.basename(fluxfile)
+            if base.endswith('.fits.fz'): base=base[:-8]
+            if base.endswith('.fits'): base=base[:-5]
+            print('{:} {:}'.format(i+1,base))
+            # Might need to modify mss filenames for TACC
+            if host=='tacc':
+                #fluxfile = taccifyname(fluxfile)
+                #wtfile = taccifyname(wtfile)
+                #maskfile = taccifyname(maskfile)
+                # The filenames are fixed above for the files that exist
+                #if fluxfile[:9] != '/net/mss1':
+                #    import pdb; pdb.set_trace()
+                if fluxfile[:9]=='/net/mss1' or wtfile[:9]=='/net/mss1' or maskfile[:9]=='/net/mss1':
+                    print('Exposure files not at TACC yet. SKIPPING')
+                    continue
+            # On tempest files are downloaded by the nsc_download script
+            #if 'tempest' in host:
+            #    fluxfile = os.path.join(download_dir,os.path.basename(inputdata['fluxfile'][i]))
+            #    wtfile = os.path.join(download_dir,os.path.basename(inputdata['wtfile'][i]))
+            #    maskfile = os.path.join(download_dir,os.path.basename(inputdata['maskfile'][i]))                
+            ## Need to download files on tempest
+            ##   use md5sum as filenames
+            #if host.startswith('tempest'):
+            #    fluxfile = inputdata['fluxmd5sum'][i]
+            #    wtfile = inputdata['wtmd5sum'][i]
+            #    maskfile = inputdata['maskmd5sum'][i]
+            # Check that all three files exist
+            else:
+                infiles = [fluxfile,wtfile,maskfile]
+                exists = [os.path.exists(f) for f in infiles]
+                bd, = np.where(np.array(exists)==False)
+                if len(bd)>0:
+                    print('Files not found: '+','.join(np.array(infiles)[bd])+'  SKIPPING')
+                    continue
+            #if base[:3] not in ['c4d','ksb','k4m']:
+            #    print(base,'NOT in correct format. SKIPPING')
+            #    continue
+            instrument = base[:3]
+            cmd = script+' '+fluxfile+' '+wtfile+' '+maskfile+' '+version
+            if host:
+                cmd += ' --host '+host
+            if redo:
+                cmd += ' --redo'
+            if delete:
+                cmd += ' --delete'
+            if stagger>0:
+                cmd += ' --stagger '+str(stagger)
+            if nowait:
+                cmd += ' --nowait'
+            # Check output filename
+            if base[:3]=='c4d':
+                night = '20'+base[4:10]
+            else:
+                instrument = 'c4d'  # assume decam for now
+                if host.startswith('tempest'):
+                    dateobs = inputdata['date_obs'][i]
+                else:
+                    head = fits.getheader(fluxfile,0)
+                    dateobs = head['DATE-OBS']
+                night = dateobs[:4]+dateobs[5:7]+dateobs[8:10]
+            outdir = os.path.join(basedir,instrument,night[:4],night,base)
+            logfile = os.path.join(outdir,base+'.'+logtime+'.log')
+            outfile = os.path.join(outdir,base+'_meas.fits')
+            if os.path.exists(outfile) and redo==False:
+                print(outfile,' ALREADY EXISTS.  Skipping')
+                continue
+            # Make sure the output directory exists
+            if os.path.exists(outdir)==False:
+                os.makedirs(outdir)
+            # Skip information in the tasks table
+            tasks['cmd'][cnt] = cmd
+            tasks['name'][cnt] = base
+            tasks['output'][cnt] = outfile
+            tasks['outfile'][cnt] = logfile 
+            tasks['errfile'][cnt] = logfile.replace('.log','.err')
+            tasks['dir'][cnt] = outdir
+            cnt += 1
+            if cnt>=maxtasks:
+                print('Reached maxtasks ',maxtasks)
+                break
+        tasks = tasks[:cnt]  # trim
+
+        # Calculate nodes needed
+        # it takes about 1 hour per exposure on average
+        # there are ~120 cores per node
+        # we can only run for 48 hours
+        ntasks = np.minimum(len(tasks),maxtasks)
+        if nodes is None:
+            total_time_hour = ntasks
+            nodes = int(np.ceil(total_time_hour/ppn/48))
+
+    ##############################################################################
+    # Calibrate
+    #==========
+    elif stage=='calib' or stage=='calibrate':
+        script = 'nsc_instcal_calibrate'
+        label = 'calib'
+
+        # Individual exposures
+        if healpix == False:
+            if isinstance(inputdata,Table)==False:
+                inputlist = inputdata.copy()
+                inputdata = Table(np.zeros(len(inputlist),dtype=np.dtype([('EXPOSURE',str,1000)])))
+                inputdata['EXPOSURE'] = inputlist
+
+            # Check previously submitted tasks lists
+            print('Checking previously submitted tasks lists')
+            tasklist = glob(os.path.join(basedir,'lists',label+'_*_tasks.fits'))
+            prevtasks = None
+            for tf in tasklist:
+                print('Loading ',tf)
+                ptasks = Table.read(tf)
+                if prevtasks is None:
+                    prevtasks = ptasks
+                else:
+                    prevtasks = vstack((prevtasks,ptasks))
+            # Some previous lists
+            if prevtasks is not None:
+                # Get unique exposures
+                _,ui = np.unique(prevtasks['name'],return_index=True)
+                prevtasks = prevtasks[ui]
+                # Remove any previously submitted exposures
+                inpexposure = np.char.array([os.path.basename(f) for f in inputdata['EXPOSURE']]).astype(str)
+                _,ind1,ind2 = np.intersect1d(prevtasks['name'],inpexposure,return_indices=True)
+                if len(ind1)>0:
+                    print(len(ind1),' previously submitted exposures to remove')
+                    inputdata.remove_rows(ind2)
+
+            # Loop over input data and populate the tasks list
+            tasks = Table(np.zeros(np.minimum(len(inputdata),maxtasks),dtype=np.dtype(dt)))
+            cnt = 0
+            for i in range(len(inputdata)):
+                # "exposure" is the full path to the exposure output directory
+                exposure = inputdata['EXPOSURE'][i]
+                if exposure.endswith('/'):
+                    exposure = exposure[:-1]
+                #outdir = os.path.dirname(exposure)
+                #outdir = exposure
+                # Use /scratch1 for calibration output for now
+                # /home1/09970/dnidever/scratch1/nsc/instcal/v4/c4d/2018/20180502/c4d_180502_092858_ooi_g_v1
+                outdir = '/home1/09970/dnidever/scratch1/nsc/instcal/' + '/'.join(exposure.split('/')[-5:])
+                base = os.path.basename(exposure)
+                print('{:} {:}'.format(i+1,base))
+                cmd = script+' '+exposure+' '+version
+                if host:
+                    cmd += ' --host '+host
+                # Check output filename
+                # we keep the meas.fits filename
+                # need to check the table columns in the header
+                measfile = os.path.join(exposure,base+'_meas.fits')
+                if os.path.exists(measfile)==False:
+                    print('meas file',measfile,'NOT FOUND. Skipping')
+                    continue
+                # Check that the meta file exists
+                #metafile = os.path.join(outdir,base+'_meta.fits')
+                #if os.path.exists(metafile) and 
+                head = fits.getheader(measfile,1)
+                # CHECK FOR THE NEEDED CALIBRATION COLUMNS
+                # and check for the meta file
+
+                # Requirements for "being done"
+                # 1) meta file exists
+                # 2) meas file exists
+                # 3) meas file has calibration columns
+            
+
+                logfile = os.path.join(outdir,base+'_calib.log')
+                outfile = os.path.join(outdir,base+'_meas.fits')
+                metafile = os.path.join(outdir,base+'_meta.fits')
+                if (os.path.exists(outfile) and os.path.exists(metafile)) and redo==False:
+                    print(outfile,' ALREADY EXISTS.  Skipping')
+                    continue
+                # Put information in the tasks table
+                tasks['cmd'][cnt] = cmd
+                tasks['name'][cnt] = base
+                tasks['output'][cnt] = outfile
+                tasks['outfile'][cnt] = logfile 
+                tasks['errfile'][cnt] = logfile.replace('.log','.err')
+                tasks['dir'][cnt] = outdir
+                cnt += 1
+                if cnt>=maxtasks:
+                    print('Reached maxtasks ',maxtasks)
+                    break
+            tasks = tasks[:cnt]  # trim
+
+            # Calculate nodes need
+            # calibration is pretty fast, maybe 1 min. per exposure
+            ntasks = np.minimum(len(tasks),maxtasks)
+            if nodes is None:
+                total_time_hour = ntasks / 60.0
+                nodes = int(np.ceil(total_time_hour/ppn/48))
+
+        # Use healpix
+        else:
+            label = 'calibhlp'
+            upix = np.unique(inputdata['pix'])
+
+            # Loop over input data and populate the tasks list
+            tasks = Table(np.zeros(np.minimum(len(inputdata),maxtasks),dtype=np.dtype(dt)))
+            outdir = '/home1/09970/dnidever/scratch1/nsc/instcal/'+version+'/logs/'
+            cnt = 0
+            for i in range(len(upix)):
+                pix = upix[i]
+                print('{:} {:}'.format(i+1,pix))
+                cmd = '{:s} None {:s} --pix {:d} --nside {:d}'.format(script,version,pix,32)
+                if host:
+                    cmd += ' --host '+host
+                logfile = os.path.join(outdir,str(pix)+'_calib.log')
+                outfile = os.path.join(outdir,str(pix)+'_meas.fits')
+                # Put information in the tasks table
+                tasks['cmd'][cnt] = cmd
+                tasks['name'][cnt] = str(pix)
+                tasks['output'][cnt] = outfile
+                tasks['outfile'][cnt] = logfile 
+                tasks['errfile'][cnt] = logfile.replace('.log','.err')
+                tasks['dir'][cnt] = outdir
+                cnt += 1
+                if cnt>=maxtasks:
+                    print('Reached maxtasks ',maxtasks)
+                    break
+            tasks = tasks[:cnt]  # trim
+
+            # Calculate nodes need
+            # calibration is pretty fast, maybe 1 min. per exposure
+            ntasks = np.minimum(len(tasks),maxtasks)
+            if nodes is None:
+                total_time_hour = ntasks / 60.0
+                nodes = int(np.ceil(total_time_hour/ppn/48))
+
+
+    ##############################################################################
+    # Combine
+    #========
+    elif stage=='combine':
+        script = 'nsc_instcal_combine'
+        label = 'combine'
+        if isinstance(inputdata,Table)==False:
+            inputlist = inputdata.copy()
+            inputdata = Table(np.zeros(len(inputlist),dtype=np.dtype([('HEALPIX',str,1000)])))
+            inputdata['HEALPILX'] = inputlist
+
+        # Check previously submitted tasks lists
+        print('Checking previously submitted tasks lists')
+        tasklist = glob(os.path.join(basedir,'lists',label+'_*_tasks.fits'))
+        prevtasks = None
+        for tf in tasklist:
+            print('Loading ',tf)
+            ptasks = Table.read(tf)
+            if prevtasks is None:
+                prevtasks = ptasks
+            else:
+                prevtasks = vstack((prevtasks,ptasks))
+        # Some previous lists
+        if prevtasks is not None:
+            # Get unique exposures
+            _,ui = np.unique(prevtasks['name'],return_index=True)
+            prevtasks = prevtasks[ui]
+            # Remove any previously submitted exposures
+            inphealpixpix = inputdata['HEALPIX']
+            _,ind1,ind2 = np.intersect1d(prevtasks['name'],inphealpix,return_indices=True)
+            if len(ind1)>0:
+                print(len(ind1),' previously submitted exposures to remove')
+                inputdata.remove_rows(ind2)
+
+        # Loop over input data and populate the tasks list
+        tasks = Table(np.zeros(np.minimum(len(inputdata),maxtasks),dtype=np.dtype(dt)))
+        cnt = 0
+        for i in range(len(inputdata)):
+            healpix = inputdata['HEALPIX'][i]
+            print('{:} {:}'.format(i+1,healpix))
+            cmd = script+' '+healpix+' '+version
+            if host:
+                cmd += ' --host '+host
+            # Check output filename
+            outdir = os.path.join(basedir,'combine',str(int(healpix)//1000,),str(healpix))
+            logfile = os.path.join(outdir,str(healpix)+'.log')
+            outfile = os.path.join(outdir,str(healpix)+'.fits.gz')
+            if os.path.exists(outfile) and redo==False:
+                print(outfile,' ALREADY EXISTS.  Skipping')
+                continue
+            # Skip information in the tasks table
+            tasks['cmd'][cnt] = cmd
+            tasks['name'][cnt] = base
+            tasks['output'][cnt] = outfile
+            tasks['outfile'][cnt] = logfile 
+            tasks['errfile'][cnt] = logfile.replace('.log','.err')
+            tasks['dir'][cnt] = outdir
+            cnt += 1
+            if cnt>=maxtasks:
+                print('Reached maxtasks ',maxtasks)
+                break
+        tasks = tasks[:cnt]  # trim
+
+        # Calculate nodes need
+        # how much per healpix??
+        ntasks = np.minimum(len(tasks),maxtasks)
+        if nodes is None:
+            total_time_hour = ntasks
+            nodes = int(np.ceil(total_time_hour/ppn/48))
+    else:
+        print('Stage ',stage,' not supported')
+        sys.exit()
+
+    print(len(tasks),' tasks to run')
+
+    # Trim to maximum number of tasks
+    if len(tasks)>maxtasks:
+        print('Trimming to maximum tasks',maxtasks)
+        tasks = tasks[:maxtasks]
+
+    if len(tasks)==0:
+        print('No tasks to run')
+        sys.exit()
+    
+    # TACC settings
+    if host=='tacc':
+        # Nodes to request
+        print(nodes,'nodes requested')
+        # Get walltime based on partition
+        wtimedict = {'normal':'47:59:00','small':'47:59:00','development':'01:59:59'}
+        walltime = wtimedict[partition]
+        # nodes:
+        # development 1-40
+        # normal      3-512
+        # small       2
+        if partition=='development':
+            if int(nodes)>40:
+                print('development node limit is 40')
+                nodes = 2
+        elif partition=='normal':
+            if int(nodes)<3:
+                print('normal needs at least 3 nodes')
+                nodes = 3
+            if int(nodes)>512:
+                print('normal node limit is 512')
+                nodes = 512
+        elif partition=='small':
+            if int(nodes) != 2:
+                print('small must be 2 nodes')
+                nodes = 2
+
+    nparallel = nodes*ppn
+
+    print('Slurm Parameters:')
+    print('ntasks =',len(tasks))
+    print('partition =',partition)
+    print('nodes =',nodes)
+    print('label =',label)
+    print('walltime =',walltime)
+    slurmroot = os.environ.get('SCRATCH')
+    if slurmroot is None:
+        slurmroot = os.path.join(os.path.expanduser('~'),'slurm')
+        if os.path.exists(slurmroot)==False:
+            os.makedirs(slurmroot)
+
+    # For measurement on Tempest we'll use our own job manager/launcher per mode
+    if stage.lower()[:4]=='meas' and host.lower().startswith('tempest'):
+        slurmdir = os.path.join(os.path.expanduser('~'),'slurm')
+        #print('Using nsc_launcher')
+        logdir = os.path.join(tmpdir,'logs')
+        #out = slrm.nsclauncher(tasks,stage,nodes=nodes,cpus=ppn,version=version,partition=partition,
+        #                       host=host,walltime=walltime,slurmdir=slurmdir,logdir=logdir,
+        #                       verbose=True)
+        precommands = None
+        if host=='tacc':
+            precommands = ['module load python3/3.9.2']
+        out = slurm.submit(tasks,label,nodes=nodes,cpus=ppn,partition=partition,
+                           shared=False,walltime=walltime,slurmroot=slurmroot,stagger=True,
+                           precommands=precommands,verbose=True)
+    elif stage=='download':
+        key,jobid = slurm.submit(tasks,label,nodes=1,cpus=1,partition=partition,
+                                 walltime=walltime,slurmroot=slurmroot)
+    else:
+        if host[:7]=='tempest':
+            #export LAUNCHER_DIR=/home/x51j468/projects/launcher
+            #export LAUNCHER_WORKDIR=/home/x51j468
+            #export LAUNCHER_JOB_FILE=/home/x51j468/test_cmds.lst
+            #export LAUNCHER_PPN=10
+            precommands = ['export LAUNCHER_DIR=/home/x51j468/projects/launcher']
+            precommands += ['export LAUNCHER_PPN='+str(nparallel)]
+            postcommands = None
+        else:
+            precommands = ['module load python3/3.9.2']
+            precommands += ['/usr/bin/rm -fR /tmp/dnidever/nsc/v4/*']
+            postcommands = ['/usr/bin/rm -fR /tmp/dnidever/nsc/v4/*']
+        slurmdir,key,jobid = slurm.launcher(tasks,label,nodes=nodes,nparallel=nparallel,
+                                            account=account,partition=partition,walltime=walltime,
+                                            notification=True,stagger=True,precommands=precommands,
+                                            postcommands=postcommands,slurmroot=slurmroot,verbose=True)
+        # Write list of output directories
+        utils.writelines(os.path.join(slurmdir,label+'_outdir.lst'),tasks['dir'].data.astype(str))
+        # Write task list to lists/ 
+        tasks.write(os.path.join(basedir,'lists',label+'_'+key+'_tasks.fits'))
+    
+
+    # submit(tasks,label,nodes=1,cpus=64,ppn=None,account='priority-davidnidever',
+    #        partition='priority',shared=True,walltime='12-00:00:00',notification=False,
+    #        memory=7500,numpy_num_threads=2,stagger=True,nodelist=None,precommands=None,
+    #        verbose=True,logger=None):    
+
+
+    # Start the logfile 
+    #------------------ 
+    #host = socket.gethostname()
+    #hostname = host.split('.')[0]
+    #logtime = datetime.now().strftime("%Y%m%d%H%M%S") 
+    ## Set up logging to screen and logfile
+    #logFormatter = logging.Formatter("%(asctime)s [%(levelname)-5.5s]  %(message)s")
+    #logger = logging.getLogger() 
+    #while logger.hasHandlers(): # some existing loggers, remove them   
+    #    logger.removeHandler(logger.handlers[0]) 
+    #logger = logging.getLogger()
+    #logtime = datetime.now().strftime("%Y%m%d%H%M%S")
+    #logfile = expdir+'/'+base+'_meas.log'
+    #if os.path.exists(logfile): os.remove(logfile)
+    #fileHandler = logging.FileHandler(logfile)
+    #fileHandler.setFormatter(logFormatter)
+    #logger.addHandler(fileHandler)
+    #consoleHandler = logging.StreamHandler()
+    #consoleHandler.setFormatter(logFormatter)
+    #logger.addHandler(consoleHandler)
+    #logger.setLevel(logging.NOTSET)
+
+
+
+
+
