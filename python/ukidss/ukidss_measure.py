@@ -56,30 +56,20 @@ else:
 class Exposure:
 
     # Initialize Exposure object
-    def __init__(self,fluxfile,wtfile,maskfile,nscversion,host,delete=False,dochips=None):
+    def __init__(self,fluxfile,version,host,delete=False,dochips=None):
         # Check that the files exist
         if os.path.exists(fluxfile) is False:
             print(fluxfile+" NOT found")
             return
-        if os.path.exists(wtfile) is False:
-            print(wtfile+" NOT found")
-            return
-        if os.path.exists(maskfile) is False:
-            print(maskfile+" NOT found")
-            return
         self.delete = delete  # delete original files
         # Setting up the object properties
         self.origfluxfile = fluxfile
-        self.origwtfile = wtfile
-        self.origmaskfile = maskfile
         self.host = host
         self.fluxfile = None      # working files in temp dir
-        self.wtfile = None        # working files in temp dir
-        self.maskfile = None      # working files in temp dir
         base = os.path.basename(fluxfile)
         base = os.path.splitext(os.path.splitext(base)[0])[0]
         self.base = base
-        self.nscversion = nscversion
+        self.version = version
         self.logfile = base+".log"
         self.logger = None
         self.origdir = None
@@ -90,15 +80,7 @@ class Exposure:
 
         # Get instrument
         head0 = fits.getheader(fluxfile,0)
-        if head0["DTINSTRU"] == 'mosaic3':
-            self.instrument = 'k4m'
-        elif head0["DTINSTRU"] == '90prime':
-            self.instrument = 'ksb'
-        elif head0["DTINSTRU"] == 'decam':
-            self.instrument = 'c4d'
-        else:
-            print("Cannot determine instrument type")
-            return
+        self.instrument = 'uks'
         # Get number of extensions
         hdulist = fits.open(fluxfile)
         nhdu = len(hdulist)
@@ -121,8 +103,8 @@ class Exposure:
         
     # Setup
     def setup(self):
-        #print("nscversion = ",nscversion)
-        basedir,tmproot = utils.getnscdirs(self.nscversion,self.host)
+        #print("version = ",version)
+        basedir,tmproot = utils.getnscdirs(self.version,self.host)
         print("dirs, setup = ",basedir,tmproot)
         # Prepare temporary directory
         tmpcntr = 1
@@ -162,25 +144,13 @@ class Exposure:
 
         # Copy over images from zeus1:/mss or Download images from Astro Data Archive
         fluxfile = "bigflux.fits.fz"
-        wtfile = "bigwt.fits.fz"
-        maskfile = "bigmask.fits.fz"
         if self.delete:
-            self.logger.info('Moving InstCal images to temporary directory')
+            self.logger.info('Moving reduced image to temporary directory')
             newfluxfile = os.path.join(tmpdir,os.path.basename(self.origfluxfile))
             if os.path.exists(newfluxfile): os.remove(newfluxfile)
             shutil.move(self.origfluxfile,newfluxfile)
             self.origfluxfile = newfluxfile
             os.symlink(os.path.basename(self.origfluxfile),fluxfile)
-            newwtfile = os.path.join(tmpdir,os.path.basename(self.origwtfile))
-            if os.path.exists(newwtfile): os.remove(newwtfile)
-            shutil.move(self.origwtfile,newwtfile)
-            self.origwtfile = newwtfile
-            os.symlink(os.path.basename(self.origwtfile),wtfile)
-            newmaskfile = os.path.join(tmpdir,os.path.basename(self.origmaskfile))
-            if os.path.exists(newmaskfile): os.remove(newmaskfile)
-            shutil.move(self.origmaskfile,newmaskfile)
-            self.origmaskfile = newmaskfile
-            os.symlink(os.path.basename(self.origmaskfile),maskfile)
         else:
             if self.host=="gp09" or self.host=="gp07":
                 self.logger.info("Copying InstCal images from mass store archive")
@@ -191,19 +161,9 @@ class Exposure:
             self.logger.info("  "+self.origfluxfile)
             if (os.path.basename(self.origfluxfile) != fluxfile):
                 os.symlink(os.path.basename(self.origfluxfile),fluxfile)
-            shutil.copyfile(self.origwtfile,os.path.join(tmpdir,os.path.basename(self.origwtfile)))
-            self.logger.info("  "+self.origwtfile)
-            if (os.path.basename(self.origwtfile) != wtfile):
-                os.symlink(os.path.basename(self.origwtfile),wtfile)
-            shutil.copyfile(self.origmaskfile,os.path.join(tmpdir,os.path.basename(self.origmaskfile)))
-            self.logger.info("  "+self.origmaskfile)
-            if (os.path.basename(self.origmaskfile) != maskfile):
-                os.symlink(os.path.basename(self.origmaskfile),maskfile)
 
         # Set local working filenames
         self.fluxfile = fluxfile
-        self.wtfile = wtfile
-        self.maskfile = maskfile
         
         # Make final output directory
         if not os.path.exists(self.outdir):
@@ -212,43 +172,28 @@ class Exposure:
 
 
     # Load chip
-    def loadchip(self,extension,fluxfile="flux.fits",wtfile="wt.fits",maskfile="mask.fits"):
+    def loadchip(self,extension,fluxfile="flux.fits"):
         # Load the data
         self.logger.info(" Loading chip "+str(extension))
         # Check that the working files set by "setup"
-        if (self.fluxfile is None) | (self.wtfile is None) | (self.maskfile is None):
+        if (self.fluxfile is None):
             self.logger.warning("Local working filenames not set.  Make sure to run setup() first")
             return(False)
         try:
             flux,fhead = fits.getdata(self.fluxfile,extension,header=True)
             fhead0 = fits.getheader(self.fluxfile,0)  # add PDU info
             fhead.extend(fhead0,unique=True)
-            wt,whead = fits.getdata(self.wtfile,extension,header=True)
-            mask,mhead = fits.getdata(self.maskfile,extension,header=True)
         except:
             self.logger.error("No extension "+str(extension))
             return(False)
-        # Some ls9 reductions have different dimensions for flux/mask and wt
-        #  the wt image has an extra perimeter of pixels 
-        if flux.shape==(4094, 2046) and wt.shape==(4096, 2048):
-            self.logger.info('ls9 reduction error. flux/mask have (4094,4046) while wt has (4096,2048).  Trimming the wt image.')
-            wt = wt[1:-1,1:-1]   # trimming extra perimeter of pixels off
-            whead['naxis1'] = 2046
-            whead['naxis2'] = 4094
         # Write the data to the appropriate files
         if os.path.exists(fluxfile):
             os.remove(fluxfile)
         fits.writeto(fluxfile,flux,header=fhead,output_verify='warn')
-        if os.path.exists(wtfile):
-            os.remove(wtfile)
-        fits.writeto(wtfile,wt,header=whead,output_verify='warn')
-        if os.path.exists(maskfile):
-            os.remove(maskfile)
-        fits.writeto(maskfile,mask,header=mhead,output_verify='warn')
         # Create the chip object
-        self.chip = Chip(fluxfile,wtfile,maskfile,self.base,self.host)
+        self.chip = Chip(fluxfile,self.base,self.host)
         self.chip.bigextension = extension
-        self.chip.nscversion = self.nscversion
+        self.chip.version = self.version
         self.chip.outdir = self.outdir
         self.chip.keepdir = self.keepdir
         # Add logger information
@@ -350,10 +295,8 @@ def fixdecamheader(header):
 # Class to represent a single chip of an exposure
 class Chip:
 
-    def __init__(self,fluxfile,wtfile,maskfile,bigbase,host):
+    def __init__(self,fluxfile,bigbase,host):
         self.fluxfile = fluxfile
-        self.wtfile = wtfile
-        self.maskfile = maskfile
         self.bigbase = bigbase
         self.host = host
         if host=="tempest_katie" or host=="tempest_group": self.bindir = "/home/x25h971/bin/"
@@ -365,9 +308,6 @@ class Chip:
         self.base = base
         self.keepdir = None
         header = fits.getheader(fluxfile)
-        # Fix early decam headers
-        if header["DTINSTRU"]!='mosaic3' and header["DTINSTRU"]!='90primt':
-            header = fixdecamheader(header)
         self.meta = phot.makemeta(header=header)
         self.sexfile = self.dir+"/"+self.base+"_sex.fits"
         self.daofile = self.dir+"/"+self.base+"_dao.fits"
@@ -482,7 +422,7 @@ class Chip:
         # We have it already, just return it
         if self._pixscale is not None:
             return self._pixscale
-        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45 }
+        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45 'uks': 0.20}
         try:
             pixscale = pixmap[self.instrument]
             self._pixscale = pixscale
@@ -550,19 +490,8 @@ class Chip:
         if self.meta is None:
             self.logger.warning("Cannot get INSTRUMENT, no header yet")
             return None
-        # instrument, c4d, k4m or ksb
-        # DTINSTRU = 'mosaic3 '
-        # DTTELESC = 'kp4m    '
-        # Bok 90Prime data has
-        if self.meta.get("DTINSTRU") == 'mosaic3':
-            self._instrument = 'k4m'
-            return self._instrument
-        elif self.meta.get("DTINSTRU") == '90prime':
-            self._instrument = 'ksb'
-            return self._instrument
-        else:
-            self._instrument = 'c4d'
-            return self._instrument
+        self._instrument = 'uks'
+        return self._instrument
 
     @property
     def plver(self):
@@ -644,9 +573,9 @@ class Chip:
             sexcatfile = "flux_sex"+str(self.sexiter)+".cat.fits"
             if self.sexcat is not None: offset=int(self.sexcat['NUMBER'][-1]) #ktedit:sex2
         #--------------------------------------------------------------------------------------------ktedit:sex2 B
-        basedir, tmpdir = utils.getnscdirs(self.nscversion,self.host)
+        basedir, tmpdir = utils.getnscdirs(self.version,self.host)
         configdir = basedir+"config/"
-        sexcat, maglim = phot.runsex(infile,self.wtfile,self.maskfile,meta,sexcatfile,configdir,
+        sexcat, maglim = phot.runsex(infile,meta,sexcatfile,configdir,
                                      offset=offset,sexiter=self.sexiter,dthresh=dthresh,
                                      logger=self.logger,bindir=self.bindir) #ktedit:sex2
         #--------------------------------------------------------------------------------------------ktedit:sex2 T
@@ -723,7 +652,7 @@ class Chip:
         
     # Make image ready for DAOPHOT
     def mkdaoim(self):
-        phot.mkdaoim(self.fluxfile,self.wtfile,self.maskfile,self.meta,self.daofile,logger=self.logger)
+        phot.mkdaoim(self.fluxfile,self.meta,self.daofile,logger=self.logger)
 
     # DAOPHOT detection
     #----------------------
@@ -1102,7 +1031,7 @@ class Chip:
         self.logger.info("  Cleaning up")
         files1 = glob("flux*")
         files2 = glob("default*")
-        files = files1+files2+["flux.fits","wt.fits","mask.fits","daophot.opt","allstar.opt"]
+        files = files1+files2+["flux.fits","daophot.opt","allstar.opt"]
         for f in files:
             if os.path.exists(f): os.remove(f)
 
@@ -1116,8 +1045,6 @@ if __name__ == "__main__":
     # Initiate input arguments
     parser = ArgumentParser(description='Run NSC Instcal Measurement Process on one Exposure.')
     parser.add_argument('--fluxfile',type=str,nargs=1,help='Full path to fluxfile')
-    parser.add_argument('--wtfile',type=str,nargs=1,help='Weightfile')
-    parser.add_argument('--maskfile',type=str,nargs=1,help='Maskfile')
     parser.add_argument('--version',type=str,nargs=1,default="None",help='Version number')
     parser.add_argument('--host',type=str,nargs=1,default="None",help='hostname, default "None", other options supported are "cca","tempest_katie","tempest_group","gp09/7"')
     parser.add_argument('--x',action='store_true', help='Exposure version is of format "vX"')
@@ -1169,7 +1096,7 @@ if __name__ == "__main__":
     t0 = time.time()
     
     # Create the Exposure object
-    exp = Exposure(fluxfile,wtfile,maskfile,nscversion=version,host=host)
+    exp = Exposure(fluxfile,wtfile,maskfile,version=version,host=host)
     # Run
     exp.run()
 

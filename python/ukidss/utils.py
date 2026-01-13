@@ -2053,8 +2053,8 @@ def concatmeas(expdir,base=None,deletetruncated=False):
     os.chdir(curdir)
 
 
-# Get NSC directories
-def getnscdirs(version=None,host=None):
+# Get UKIDSS directories
+def getdirs(version=None,host=None):
     # username
     try:
         username = getpwuid(os.getuid())[0]
@@ -2069,26 +2069,14 @@ def getnscdirs(version=None,host=None):
         hostname = socket.gethostname()
         host = hostname.split('.')[0].strip()
     print("host = ",host)
-    # on gp07 use
-    if (host == "gp09") | (host == "gp08") | (host == "gp07") | (host == "gp06") | (host == "gp05"): 
-        basedir = os.path.join("/net/dl2/kfas/nsc/instcal/",verdir)
-        tpmroot = os.path.join(basedir,"tmp")
-    # on tempest use
-    elif host=="tempest_katie":
-        basedir = os.path.join("/home/x25h971/nsc/instcal/",verdir)
-        tmproot = os.path.join(basedir,"tmp/")
-    elif host=="tempest_group":
-        basedir = os.path.join("/home/group/davidnidever/nsc/instcal/",verdir)
+    if host=="tempest":
+        basedir = os.path.join("/home/group/davidnidever/ukidss/",verdir)
         #tmproot = os.path.join(basedir,"tmp")
-        tmproot = os.path.join('/tmp',username,'nsc','instcal',verdir)
-    elif host=="cca":
-        basedir = os.path.join('/mnt/home/dnidever/ceph/nsc/instcal/',verdir)
-        tmproot = os.path.join('/mnt/home/dnidever/ceph/nsc/',verdir,'tmp')
-    elif host=="tacc":
-        #basedir = '/corral/projects/NOIRLab/nsc/instcal/'+verdir
-        basedir = os.path.join('/scratch1/09970/dnidever/nsc/instcal/',verdir)
-        #tmproot = os.path.join('/scratch1/09970/dnidever/nsc/',verdir,'tmp')
-        tmproot = os.path.join('/tmp',username,'nsc',verdir)
+        tmproot = os.path.join('/tmp',username,'ukidss',verdir)
+    elif host=="hulk" or host=="thing" or host=="noirlab":
+        basedir = os.path.join("/net/dl2/dnidever/ukidss/",verdir)
+        #tmproot = os.path.join(basedir,"tmp")
+        tmproot = os.path.join('/tmp',username,'ukidss',verdir)
     else:
         basedir = os.getcwd()
         tmproot = os.path.join(basedir,"tmp")

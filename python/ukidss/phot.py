@@ -70,7 +70,7 @@ def ada_query(type,adsurl,search_params,rawname,udir,outdir="",fbase=""):
     
 
 # Download exposures from Astro Data Archive, mostly use for Tempest.
-def getdata(rawname,fluxfile,wtfile,maskfile,basedir,outdir):
+def getdata(rawname,fluxfile,basedir,outdir):
     '''Download exposures from Astro Data Archive'''
     # -- Set up & Inputs --
     natroot = 'https://astroarchive.noirlab.edu'    # ADA url
@@ -80,8 +80,6 @@ def getdata(rawname,fluxfile,wtfile,maskfile,basedir,outdir):
     makedir(udir)                                     # unavailable for download from ADA, for whatever reason
     unavails = udir+"unavail_exposures.txt"         # File for storing unavailable/unreleased file bases
     fluxbase = os.path.basename(fluxfile)           # Name of epxosure fluxfile
-    wtbase = os.path.basename(wtfile)                                # wtfile
-    maskbase = os.path.basename(maskfile)                            # maskfile
     print('Downloading data for exposure RAWNAME = ',rawname)
     
     # -- Try a RAWNAME query to get all 3 flux,wt,maskfiles --
@@ -94,7 +92,7 @@ def getdata(rawname,fluxfile,wtfile,maskfile,basedir,outdir):
     # -- If the files were not found by a RAWNAME query, do an individual search for each --
     if len(res)<3:
         print("flux, weight, mask files not found in rawname query.  trying an individual query for each.")
-        for fl in [fluxbase,wtbase,maskbase]:   # for each 
+        for fl in [fluxbase]:   # for each 
             jj_fl = {"outfields" : ["original_filename", "archive_filename", "proc_type", "url"],"search" : [["archive_filename",fl, 'icontains'],]}
             res_fl = ada_query("query",adsurl,jj_fl,rawname,udir,outdir,fl)
             res = pd.concat([res,res_fl],axis=0,ignore_index=True)
@@ -106,8 +104,8 @@ def getdata(rawname,fluxfile,wtfile,maskfile,basedir,outdir):
     #print("res =\n",res.url)
 
     # -- Get the base names --
-    files = [fluxfile,maskfile,wtfile]
-    bases = [fluxbase,maskbase,wtbase]
+    files = [fluxfile]
+    bases = [fluxbase]
     archive_bases = [os.path.basename(f) for f in res.archive_filename]
     #print("base =/n",base)
     #fluxind = np.where(np.array(base)==fluxbase)[0]
@@ -773,7 +771,7 @@ def sextodao(cat=None,meta=None,outfile=None,format="lst",naxis1=None,naxis2=Non
 
 # Run Source Extractor
 #---------------------
-def runsex(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,configdir=None,
+def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
            offset=0,sexiter=1,dthresh=2.0,logfile=None,logger=None,bindir=None): #ktedit:sex2
     '''
     Run Source Extractor on an exposure.  The program is configured to work with files
@@ -783,10 +781,6 @@ def runsex(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,config
     ----------
     fluxfile : str
              The filename of the flux FITS image.
-    wtfile : str
-           The filename of the weight (1/variance) FITS image.
-    maskfile : str
-             The filename of the mask FITS image.
     meta : astropy header
          The meta-data dictionary for the exposure.
     outfile : str
@@ -819,7 +813,7 @@ def runsex(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,config
 
     .. code-block:: python
 
-        cat, maglim = runsex("flux.fits","wt.fits","mask.fits",meta,"cat.fits","/data/config/","sex.log")
+        cat, maglim = runsex("flux.fits",meta,"cat.fits","/data/config/","sex.log")
 
     '''
 
@@ -833,12 +827,6 @@ def runsex(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,config
     if fluxfile is None:
         logger.warning("No fluxfile input")
         return
-    if wtfile is None:
-        logger.warning("No wtfile input")
-        return
-    if maskfile is None:
-        logger.warning("No maskfile input")
-        return
     if meta is None:
         logger.warning("No meta-data dictionary input")
         return
@@ -850,7 +838,7 @@ def runsex(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,config
         return
 
     # Check that necessary files exist
-    for f in [fluxfile,wtfile,maskfile]:
+    for f in [fluxfile]:
         if os.path.exists(f) is False:
             logger.warning(f+" NOT found")
             return None
@@ -1477,7 +1465,7 @@ def mkopt(base=None,meta=None,VA=1,LO=7.0,TH=3.5,LS=0.2,HS=1.0,LR=-1.0,HR=1.0,
 
 
 # Make image ready for DAOPHOT
-def mkdaoim(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,logger=None):
+def mkdaoim(fluxfile=None,meta=None,outfile=None,logger=None):
     '''
     This constructs a FITS image that is prepared for DAOPHOT.
     This program was designed for exposures from the NOAO Community Pipeline.
@@ -1486,10 +1474,6 @@ def mkdaoim(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,logge
     ----------
     fluxfile : str
              The filename of the flux FITS image.
-    wtfile : str
-           The filename of the weight (1/variance) FITS image.
-    maskfile : str
-             The filename of the mask FITS image.
     meta : astropy header
          The meta-data dictionary for the exposure.
     outfile : str
@@ -1514,12 +1498,6 @@ def mkdaoim(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,logge
     if fluxfile is None:
         logger.warning("No fluxfile input")
         return
-    if wtfile is None:
-        logger.warning("No wtfile input")
-        return
-    if maskfile is None:
-        logger.warning("No maskfile input")
-        return
     if meta is None:
         logger.warning("No meta-data dictionary input")
         return
@@ -1535,8 +1513,6 @@ def mkdaoim(fluxfile=None,wtfile=None,maskfile=None,meta=None,outfile=None,logge
 
     # Load the FITS files
     flux,fhead = fits.getdata(fluxfile,header=True)
-    wt,whead = fits.getdata(wtfile,header=True)
-    mask,mhead = fits.getdata(maskfile,header=True)
 
     # Set bad pixels to saturation value
     # --DESDM bit masks (from Gruendl):
