@@ -17,6 +17,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.utils.exceptions import AstropyWarning
 from astropy.table import Table, Column
+from astropy.stats import sigma_clipped_stats
 import time
 import shutil
 import subprocess
@@ -585,6 +586,9 @@ def makemeta(fluxfile=None,header=None):
             w = WCS(meta)
             meta["PIXSCALE"] = np.max(np.abs(w.pixel_scale_matrix))
 
+    # saturation
+    meta["SATURATE"] = 40000
+
     return meta
 
 
@@ -758,6 +762,50 @@ def sextodao(cat=None,meta=None,outfile=None,format="lst",naxis1=None,naxis2=Non
         logger.warning(format+" NOT supported")
         return
 
+def ukirt_sigmamap(sci,conf,skynoise):
+
+    # dimensionless confidence, median ~ 1
+    C = conf / 100.0
+
+    #good = C > 0
+
+    # Mark perimeter of 35 pixels as bad
+    ny,nx = sci.shape
+    edge = 35
+    geom_good = (
+        (np.arange(nx)[None, :] >= edge) &
+        (np.arange(nx)[None, :] < nx - edge) &
+        (np.arange(ny)[:, None] >= edge) &
+        (np.arange(ny)[:, None] < ny - edge)
+    )
+    
+    conf_good = conf >= 50
+    
+    good = geom_good & conf_good
+
+    # crude sky selection: only pixels near nominal confidence
+    ref = good & (C > 0.9) & (C < 1.1)
+
+    # If you have a source mask, apply it here (recommended).
+    # For a first pass, sigma clipping is often OK:
+    #mean, med, sig0 = sigma_clipped_stats(sci[ref], sigma=3.0, maxiters=10)
+
+    #sigma = np.full_like(sci, np.inf, dtype=np.float32)
+    #sigma[good] = skynoise / np.sqrt(C[good])
+
+    #ivar = np.zeros_like(sci, dtype=np.float32)
+    #ivar[good] = C[good] / (skynoise**2)
+
+    wt = np.zeros_like(sci, dtype=np.float32)
+    wt[good] = (skynoise**2) / C[good]
+
+    mask = np.zeros_like(sci, dtype=np.int32)
+    mask[~good] = 1
+
+    #print(f"sigma0={sig0:.4g}, sci_median={med:.4g}, goodfrac={good.mean():.3f}")
+
+    return wt,mask
+
 
 # Run Source Extractor
 #---------------------
@@ -845,24 +893,30 @@ def runsex(fluxfile=None,conffile=None,meta=None,outfile=None,configdir=None,
     # Working filenames
     sexbase = base+"_sex"
     sfluxfile = sexbase+".flux.fits"
-    sconffile = sexbase+".conf.fits"
+    swtfile = sexbase+".wt.fits"
+    smaskfile = sexbase+".mask.fits"
 
     if os.path.exists(outfile): os.remove(outfile)
     if os.path.exists(sfluxfile): os.remove(sfluxfile)
-    if os.path.exists(sconffile): os.remove(sconffile)
+    if os.path.exists(swtfile): os.remove(swtfile)
+    if os.path.exists(smaskfile): os.remove(smaskfile)
     if os.path.exists(logfile): os.remove(logfile)
 
     # Load the data
     flux,fhead = fits.getdata(fluxfile,header=True)
+    flux = flux.astype(float)
     conf,chead = fits.getdata(conffile,header=True)
+    conf = conf.astype(float)
+    # construct sigma map
+    skynoise = fhead['skynoise']
+    wt,mask = ukirt_sigmamap(flux,conf,skynoise)
 
     # 3a) Make subimages for flux, weight, mask
 
-    import pdb; pdb.set_trace()
-
     # Write out the files
     shutil.copy(fluxfile,sfluxfile)
-    fits.writeto(swtfile,wt,header=whead,output_verify='warn')
+    fits.writeto(swtfile,wt,header=chead,output_verify='warn')
+    fits.writeto(smaskfile,mask,header=chead,output_verify='warn')
 
 
     # 3b) Make SExtractor config files
@@ -982,7 +1036,7 @@ def runsex(fluxfile=None,conffile=None,meta=None,outfile=None,configdir=None,
         newmask = np.copy(mask)
         newmask[bad] = 1     # mask out the neighboring pixels
         # Write new mask
-        fits.writeto(smaskfile,newmask,header=mhead,output_verify='warn')
+        fits.writeto(smaskfile,newmask,header=chead,output_verify='warn',overwrite=True)
 
     # 3c) Run SExtractor
     try:
@@ -1033,7 +1087,8 @@ def runsex(fluxfile=None,conffile=None,meta=None,outfile=None,configdir=None,
 
     # Delete temporary files
     if os.path.exists(sfluxfile): os.remove(sfluxfile)
-    if os.path.exists(sconffile): os.remove(sconffile)
+    if os.path.exists(swtfile): os.remove(swtfile)
+    if os.path.exists(smaskfile): os.remove(smaskfile)
     #os.remove("default.conv")
     
     return cat,maglim
@@ -1468,7 +1523,13 @@ def mkdaoim(fluxfile=None,conffile=None,meta=None,outfile=None,logger=None):
 
     # Load the FITS files
     flux,fhead = fits.getdata(fluxfile,header=True)
+    flux = flux.astype(float)
     conf,chead = fits.getdata(conffile,header=True)
+    conf = conf.astype(float)
+    # construct sigma map
+    skynoise = fhead['skynoise']
+    wt,mask = ukirt_sigmamap(flux,conf,skynoise)
+
 
     # Set bad pixels to saturation value
     # --DESDM bit masks (from Gruendl):
@@ -1512,21 +1573,21 @@ def mkdaoim(fluxfile=None,conffile=None,meta=None,outfile=None,logger=None):
     # 128 for Pre-V3.5.0 images and set 7 values to zero for V3.5.0 or later.
 
     #logger.info("Turning off the CP difference image masking flags")
-    if meta.get("plver") is not None:      # CP data
-        # V3.5.0 and on, Integer masks
-        versnum = meta["plver"].split('.')
-        if (int(versnum[0][-1])>3) or ((int(versnum[0][-1])==3) and (int(versnum[1])>=5)):
-            bdpix = (mask == 7)
-            nbdpix = np.sum(bdpix)
-            if nbdpix > 0: mask[bdpix]=0
-
-        # Pre-V3.5.0, Bitmasks
-        else:
-            bdpix = ( (mask & 2**7) == 2**7)
-            nbdpix = np.sum(bdpix)                
-            if nbdpix > 0: mask[bdpix]-=128   # clear 128
-
-        logger.info("%d pixels cleared of difference image mask flag" % nbdpix)
+    #if meta.get("plver") is not None:      # CP data
+    #    # V3.5.0 and on, Integer masks
+    #    versnum = meta["plver"].split('.')
+    #    if (int(versnum[0][-1])>3) or ((int(versnum[0][-1])==3) and (int(versnum[1])>=5)):
+    #        bdpix = (mask == 7)
+    #        nbdpix = np.sum(bdpix)
+    #        if nbdpix > 0: mask[bdpix]=0
+    #
+    #    # Pre-V3.5.0, Bitmasks
+    #    else:
+    #        bdpix = ( (mask & 2**7) == 2**7)
+    #        nbdpix = np.sum(bdpix)                
+    #        if nbdpix > 0: mask[bdpix]-=128   # clear 128
+    #
+    #    logger.info("%d pixels cleared of difference image mask flag" % nbdpix)
 
     bdpix = (mask > 0.0)
     nbdpix = np.sum(bdpix)
@@ -1535,8 +1596,8 @@ def mkdaoim(fluxfile=None,conffile=None,meta=None,outfile=None,logger=None):
 
     fhead.append('GAIN',meta["GAIN"])
     fhead.append('RDNOISE',meta["RDNOISE"])
-    if 'plver' not in fhead:
-        fhead['plver'] = meta['PLVER']
+    #if 'plver' not in fhead:
+    #    fhead['plver'] = meta['PLVER']
 
     # DAOPHOT can only handle BITPIX=16, 32, -32
     if fhead['BITPIX'] not in [16,32,-32]:

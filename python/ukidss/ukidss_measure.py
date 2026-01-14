@@ -163,10 +163,7 @@ class Exposure:
             self.origconffile = newconffile
             os.symlink(os.path.basename(self.origconffile),conffile)
         else:
-            if self.host=="gp09" or self.host=="gp07":
-                self.logger.info("Copying InstCal images from mass store archive")
-            else:
-                self.logger.info("Copying InstCal images downloaded from Astro Data Archive")
+            self.logger.info("Copying InstCal images downloaded from UKIRT Archive")
             #getdata(rawname,self.origfluxfile,self.origwtfile,self.origmaskfile,tmpdir)            
             shutil.copyfile(self.origfluxfile,os.path.join(tmpdir,os.path.basename(self.origfluxfile)))
             self.logger.info("  "+self.origfluxfile)
@@ -436,6 +433,9 @@ class Chip:
         if 'CCDNUM' in self.meta.keys():
             self._ccdnum = self.meta['CCDNUM']
             return self._ccdnum
+        if 'CAMNUM' in self.meta.keys():
+            self._ccdnum = self.meta['CAMNUM']
+            return self._ccdnum
         self.logger.warning('No CCDNUM found')
         return None
             
@@ -467,8 +467,9 @@ class Chip:
         if 'SATURATE' in self.meta.keys():
             self._saturate = self.meta['SATURATE']
             return self._saturate
-        self.logger.warning('No SATURATE found')
-        return None
+        self._saturate = 40000
+        #self.logger.warning('No SATURATE found')
+        return self._saturate
     
     @property
     def wcs(self):
