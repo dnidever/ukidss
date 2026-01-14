@@ -499,8 +499,11 @@ class Chip:
         # Get rdnoise from the header
         # We have this key, set _rndoise and return
         if 'EXPTIME' in self.meta.keys():
-                self._exptime = self.meta['EXPTIME']
-                return self._exptime
+            self._exptime = self.meta['EXPTIME']
+            return self._exptime
+        if 'EXP_TIME' in self.meta.keys():
+            self._exptime = self.meta['EXP_TIME']
+            return self._exptime
         print('No EXPTIME found')
         return None
 

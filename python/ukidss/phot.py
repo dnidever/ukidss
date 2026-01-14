@@ -588,6 +588,8 @@ def makemeta(fluxfile=None,header=None):
 
     # saturation
     meta["SATURATE"] = 40000
+    # saturation
+    meta["EXPTIME"] = meta['exp_time']
 
     return meta
 
