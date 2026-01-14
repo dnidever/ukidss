@@ -70,7 +70,7 @@ def ada_query(type,adsurl,search_params,rawname,udir,outdir="",fbase=""):
     
 
 # Download exposures from Astro Data Archive, mostly use for Tempest.
-def getdata(rawname,fluxfile,basedir,outdir):
+def getdata(rawname,fluxfile,conffile,basedir,outdir):
     '''Download exposures from Astro Data Archive'''
     # -- Set up & Inputs --
     natroot = 'https://astroarchive.noirlab.edu'    # ADA url
@@ -80,6 +80,7 @@ def getdata(rawname,fluxfile,basedir,outdir):
     makedir(udir)                                     # unavailable for download from ADA, for whatever reason
     unavails = udir+"unavail_exposures.txt"         # File for storing unavailable/unreleased file bases
     fluxbase = os.path.basename(fluxfile)           # Name of epxosure fluxfile
+    confbase = os.path.basename(conffile)           # Name of epxosure fluxfile
     print('Downloading data for exposure RAWNAME = ',rawname)
     
     # -- Try a RAWNAME query to get all 3 flux,wt,maskfiles --
@@ -92,7 +93,7 @@ def getdata(rawname,fluxfile,basedir,outdir):
     # -- If the files were not found by a RAWNAME query, do an individual search for each --
     if len(res)<3:
         print("flux, weight, mask files not found in rawname query.  trying an individual query for each.")
-        for fl in [fluxbase]:   # for each 
+        for fl in [fluxbase,confbase]:   # for each 
             jj_fl = {"outfields" : ["original_filename", "archive_filename", "proc_type", "url"],"search" : [["archive_filename",fl, 'icontains'],]}
             res_fl = ada_query("query",adsurl,jj_fl,rawname,udir,outdir,fl)
             res = pd.concat([res,res_fl],axis=0,ignore_index=True)
@@ -104,8 +105,8 @@ def getdata(rawname,fluxfile,basedir,outdir):
     #print("res =\n",res.url)
 
     # -- Get the base names --
-    files = [fluxfile]
-    bases = [fluxbase]
+    files = [fluxfile,conffile]
+    bases = [fluxbase,confbase]
     archive_bases = [os.path.basename(f) for f in res.archive_filename]
     #print("base =/n",base)
     #fluxind = np.where(np.array(base)==fluxbase)[0]
@@ -535,19 +536,7 @@ def makemeta(fluxfile=None,header=None):
     meta = header
 
     #- INSTCODE -
-    if "DTINSTRU" in meta.keys():
-        if meta["DTINSTRU"] == 'mosaic3':
-            meta["INSTCODE"] = 'k4m'
-        elif meta["DTINSTRU"] == '90prime':
-            meta["INSTCODE"] = 'ksb'
-        elif meta["DTINSTRU"] == 'decam':
-            meta["INSTCODE"] = 'c4d'
-        else:
-            print("Cannot determine INSTCODE type")
-            return
-    else:
-        print("No DTINSTRU found in header.  Cannot determine instrument type")
-        return
+    meta['INSTCODE'] = 'uks'
 
     #- RDNOISE -
     if "RDNOISE" not in meta.keys():
@@ -581,14 +570,15 @@ def makemeta(fluxfile=None,header=None):
             meta["GAIN"] = gain
     #- CPFWHM -
     # FWHM values are ONLY in the extension headers
-    cpfwhm_map = { 'c4d': 1.5 if meta.get('FWHM') is None else meta.get('FWHM')*0.27, 
-                   'k4m': 1.5 if meta.get('SEEING1') is None else meta.get('SEEING1'),
-                   'ksb': 1.5 if meta.get('SEEING1') is None else meta.get('SEEING1') }
-    cpfwhm = cpfwhm_map[meta["INSTCODE"]]
-    meta['CPFWHM'] = cpfwhm
+    #cpfwhm_map = { 'c4d': 1.5 if meta.get('FWHM') is None else meta.get('FWHM')*0.27, 
+    #               'k4m': 1.5 if meta.get('SEEING1') is None else meta.get('SEEING1'),
+    #               'ksb': 1.5 if meta.get('SEEING1') is None else meta.get('SEEING1') }
+    #cpfwhm = cpfwhm_map[meta["INSTCODE"]]
+    #meta['CPFWHM'] = cpfwhm
+    meta['CPFWHM'] = meta.get('SEEING')
     #- PIXSCALE -
     if "PIXSCALE" not in meta.keys():
-        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45 }
+        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45, 'uks': 0.20 }
         try:
             meta["PIXSCALE"] = pixmap[meta["INSTCODE"]]
         except:
@@ -771,7 +761,7 @@ def sextodao(cat=None,meta=None,outfile=None,format="lst",naxis1=None,naxis2=Non
 
 # Run Source Extractor
 #---------------------
-def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
+def runsex(fluxfile=None,conffile=None,meta=None,outfile=None,configdir=None,
            offset=0,sexiter=1,dthresh=2.0,logfile=None,logger=None,bindir=None): #ktedit:sex2
     '''
     Run Source Extractor on an exposure.  The program is configured to work with files
@@ -781,6 +771,8 @@ def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
     ----------
     fluxfile : str
              The filename of the flux FITS image.
+    conffile : str
+           The filename of the confidence FITS image.
     meta : astropy header
          The meta-data dictionary for the exposure.
     outfile : str
@@ -827,6 +819,9 @@ def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
     if fluxfile is None:
         logger.warning("No fluxfile input")
         return
+    if conffile is None:
+        logger.warning("No conffile input")
+        return
     if meta is None:
         logger.warning("No meta-data dictionary input")
         return
@@ -838,7 +833,7 @@ def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
         return
 
     # Check that necessary files exist
-    for f in [fluxfile]:
+    for f in [fluxfile,conffile]:
         if os.path.exists(f) is False:
             logger.warning(f+" NOT found")
             return None
@@ -850,64 +845,20 @@ def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
     # Working filenames
     sexbase = base+"_sex"
     sfluxfile = sexbase+".flux.fits"
-    swtfile = sexbase+".wt.fits"
-    smaskfile = sexbase+".mask.fits"
+    sconffile = sexbase+".conf.fits"
 
     if os.path.exists(outfile): os.remove(outfile)
     if os.path.exists(sfluxfile): os.remove(sfluxfile)
-    if os.path.exists(swtfile): os.remove(swtfile)
-    if os.path.exists(smaskfile): os.remove(smaskfile)
+    if os.path.exists(sconffile): os.remove(sconffile)
     if os.path.exists(logfile): os.remove(logfile)
 
     # Load the data
     flux,fhead = fits.getdata(fluxfile,header=True)
-    wt,whead = fits.getdata(wtfile,header=True)
-    mask,mhead = fits.getdata(maskfile,header=True)
+    conf,chead = fits.getdata(conffile,header=True)
 
     # 3a) Make subimages for flux, weight, mask
 
-    # Turn the mask from integer to bitmask
-    if ((meta["INSTCODE"]=='c4d') & (meta["plver"]>='V3.5.0')) | (meta["INSTCODE"]=='k4m') | (meta["INSTCODE"]=='ksb'):
-         #  1 = bad (in static bad pixel mask) -> 1
-         #  2 = no value (for stacks)          -> 2
-         #  3 = saturated                      -> 4
-         #  4 = bleed mask                     -> 8
-         #  5 = cosmic ray                     -> 16
-         #  6 = low weight                     -> 32
-         #  7 = diff detect                    -> 64
-         omask = mask.copy()
-         mask *= 0
-         nonzero = (omask>0)
-         mask[nonzero] = 2**((omask-1)[nonzero])    # This takes about 1 sec
-    # Fix the DECam Pre-V3.5.0 masks
-    if (meta["INSTCODE"]=='c4d') & (meta["plver"]<'V3.5.0'):
-      # --CP bit masks, Pre-V3.5.0 (PLVER)
-      # Bit   DQ Type  PROCTYPE
-      # 1  detector bad pixel          ->  1 
-      # 2  saturated                   ->  4
-      # 4  interpolated                ->  32
-      # 16  single exposure cosmic ray ->  16
-      # 64  bleed trail                ->  8
-      # 128  multi-exposure transient  ->  0 TURN OFF
-      # --CP bit masks, V3.5.0 on (after ~10/28/2014), integer masks
-      #  1 = bad (in static bad pixel mask)
-      #  2 = no value (for stacks)
-      #  3 = saturated
-      #  4 = bleed mask
-      #  5 = cosmic ray
-      #  6 = low weight
-      #  7 = diff detect
-      omask = mask.copy()
-      mask *= 0     # re-initialize
-      mask += (np.bitwise_and(omask,1)==1) * 1    # bad pixels
-      mask += (np.bitwise_and(omask,2)==2) * 4    # saturated
-      mask += (np.bitwise_and(omask,4)==4) * 32   # interpolated
-      mask += (np.bitwise_and(omask,16)==16) * 16  # cosmic ray
-      mask += (np.bitwise_and(omask,64)==64) * 8   # bleed trail
-
-    # Mask out bad pixels in WEIGHT image
-    #  set wt=0 for mask>0 pixels
-    wt[ (mask>0) | (wt<0) ] = 0   # CP sets bad pixels to wt=0 or sometimes negative
+    import pdb; pdb.set_trace()
 
     # Write out the files
     shutil.copy(fluxfile,sfluxfile)
@@ -1082,8 +1033,7 @@ def runsex(fluxfile=None,meta=None,outfile=None,configdir=None,
 
     # Delete temporary files
     if os.path.exists(sfluxfile): os.remove(sfluxfile)
-    if os.path.exists(smaskfile): os.remove(smaskfile)
-    if os.path.exists(smaskfile): os.remove(swtfile)
+    if os.path.exists(sconffile): os.remove(sconffile)
     #os.remove("default.conv")
     
     return cat,maglim
@@ -1465,7 +1415,7 @@ def mkopt(base=None,meta=None,VA=1,LO=7.0,TH=3.5,LS=0.2,HS=1.0,LR=-1.0,HR=1.0,
 
 
 # Make image ready for DAOPHOT
-def mkdaoim(fluxfile=None,meta=None,outfile=None,logger=None):
+def mkdaoim(fluxfile=None,conffile=None,meta=None,outfile=None,logger=None):
     '''
     This constructs a FITS image that is prepared for DAOPHOT.
     This program was designed for exposures from the NOAO Community Pipeline.
@@ -1474,6 +1424,8 @@ def mkdaoim(fluxfile=None,meta=None,outfile=None,logger=None):
     ----------
     fluxfile : str
              The filename of the flux FITS image.
+    conffile: str
+         The filename of the confidence FITS image.
     meta : astropy header
          The meta-data dictionary for the exposure.
     outfile : str
@@ -1498,6 +1450,9 @@ def mkdaoim(fluxfile=None,meta=None,outfile=None,logger=None):
     if fluxfile is None:
         logger.warning("No fluxfile input")
         return
+    if conffile is None:
+        logger.warning("No conffile input")
+        return
     if meta is None:
         logger.warning("No meta-data dictionary input")
         return
@@ -1506,13 +1461,14 @@ def mkdaoim(fluxfile=None,meta=None,outfile=None,logger=None):
         return
 
     # Check that necessary files exist
-    for f in [fluxfile,wtfile,maskfile]:
+    for f in [fluxfile,conffile]:
         if os.path.exists(f) is False:
             logger.warning(f+" NOT found")
             return None
 
     # Load the FITS files
     flux,fhead = fits.getdata(fluxfile,header=True)
+    conf,chead = fits.getdata(conffile,header=True)
 
     # Set bad pixels to saturation value
     # --DESDM bit masks (from Gruendl):

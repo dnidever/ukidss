@@ -24,6 +24,7 @@ if __name__ == "__main__":
     # Run measurement on one full DECam/Mosaic3/Bok InstCal image
     parser = ArgumentParser(description='Run measurement on one UKIDSS reduced and stacked image')
     parser.add_argument('fluxfile', type=str, nargs=1, help='Absolute flux filename')
+    parser.add_argument('conffile', type=str, nargs=1, help='confidence filename')
     parser.add_argument('version', type=str, nargs=1, help='NSC version')
     parser.add_argument('--host',type=str,nargs=1,default="None",help='hostname, default "None", other options supported are "cca","tempest_katie","tempest_group","gp09/7","tacc"')
     parser.add_argument('--stagger',type=int, nargs=1, default=60, help='Stagger time')
@@ -73,12 +74,9 @@ if __name__ == "__main__":
     fluxfile = args.fluxfile
     if type(fluxfile) is list:
         fluxfile = fluxfile[0]
-    wtfile = args.wtfile
-    if type(wtfile) is list:
-        wtfile = wtfile[0]
-    maskfile = args.maskfile
-    if type(maskfile) is list:
-        maskfile = maskfile[0]
+    conffile = args.conffile
+    if type(conffile) is list:
+        conffile = conffile[0]
 
     ## Download files from archive using md5sum
     #files = {'fluxfile':fluxfile,'wtfile':wtfile,'maskfile':maskfile}
@@ -110,6 +108,9 @@ if __name__ == "__main__":
     # Check that the files exist
     if os.path.exists(fluxfile) is False:
         print(fluxfile+" file NOT FOUND")
+        sys.exit()
+    if os.path.exists(conffile) is False:
+        print(conffile+" file NOT FOUND")
         sys.exit()
 
     # Check that the InstCal files are not corrupted
@@ -162,8 +163,7 @@ if __name__ == "__main__":
     t0 = time.time()
 
     # Create the Exposure object
-    exp = Exposure(fluxfile,version=version,
-                   host=host,dochips=chips)
+    exp = Exposure(fluxfile,conffile,version=version,host=host,dochips=chips)
 
     # Check if the output files already exist
     if redo==False and os.path.exists(exp.outdir):

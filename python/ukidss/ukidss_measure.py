@@ -40,12 +40,12 @@ from . import phot,slurm_funcs,utils
 warnings.filterwarnings("ignore", message="numpy.dtype size changed")
 warnings.filterwarnings("ignore", message="numpy.ufunc size changed")
 
-# Load default DECam chip data
-if os.path.exists(utils.datadir()+'params/decam_chip_data.fits'):
-    DECAM_DATA = Table.read(utils.datadir()+'params/decam_chip_data.fits')
-else:
-    print('Could not find decam_chip_data.fits file')
-    DECAM_DATA = None
+## Load default DECam chip data
+#if os.path.exists(utils.datadir()+'params/decam_chip_data.fits'):
+#    DECAM_DATA = Table.read(utils.datadir()+'params/decam_chip_data.fits')
+#else:
+#    print('Could not find decam_chip_data.fits file')
+#    DECAM_DATA = None
 
 #-------------------------------------------------
 # Functions
@@ -56,16 +56,21 @@ else:
 class Exposure:
 
     # Initialize Exposure object
-    def __init__(self,fluxfile,version,host,delete=False,dochips=None):
+    def __init__(self,fluxfile,conffile,version,host,delete=False,dochips=None):
         # Check that the files exist
         if os.path.exists(fluxfile) is False:
             print(fluxfile+" NOT found")
             return
+        if os.path.exists(conffile) is False:
+            print(conffile+" NOT found")
+            return
         self.delete = delete  # delete original files
         # Setting up the object properties
         self.origfluxfile = fluxfile
+        self.origconffile = conffile
         self.host = host
         self.fluxfile = None      # working files in temp dir
+        self.conffile = None      # working files in temp dir
         base = os.path.basename(fluxfile)
         base = os.path.splitext(os.path.splitext(base)[0])[0]
         self.base = base
@@ -97,14 +102,14 @@ class Exposure:
         night = dateobs[0:4]+dateobs[5:7]+dateobs[8:10]
         self.night = night
         # Output directory
-        basedir,tmpdir = utils.getnscdirs(nscversion,self.host)
+        basedir,tmpdir = utils.getdirs(version,self.host)
         self.outdir = os.path.join(basedir,self.instrument,self.night[:4],
                                    self.night,self.base)
         
     # Setup
     def setup(self):
         #print("version = ",version)
-        basedir,tmproot = utils.getnscdirs(self.version,self.host)
+        basedir,tmproot = utils.getdirs(self.version,self.host)
         print("dirs, setup = ",basedir,tmproot)
         # Prepare temporary directory
         tmpcntr = 1
@@ -144,6 +149,7 @@ class Exposure:
 
         # Copy over images from zeus1:/mss or Download images from Astro Data Archive
         fluxfile = "bigflux.fits.fz"
+        conffile = "bigconf.fits.fz"
         if self.delete:
             self.logger.info('Moving reduced image to temporary directory')
             newfluxfile = os.path.join(tmpdir,os.path.basename(self.origfluxfile))
@@ -151,6 +157,11 @@ class Exposure:
             shutil.move(self.origfluxfile,newfluxfile)
             self.origfluxfile = newfluxfile
             os.symlink(os.path.basename(self.origfluxfile),fluxfile)
+            newconffile = os.path.join(tmpdir,os.path.basename(self.origconffile))
+            if os.path.exists(newconffile): os.remove(newconffile)
+            shutil.move(self.origconffile,newconffile)
+            self.origconffile = newconffile
+            os.symlink(os.path.basename(self.origconffile),conffile)
         else:
             if self.host=="gp09" or self.host=="gp07":
                 self.logger.info("Copying InstCal images from mass store archive")
@@ -161,10 +172,16 @@ class Exposure:
             self.logger.info("  "+self.origfluxfile)
             if (os.path.basename(self.origfluxfile) != fluxfile):
                 os.symlink(os.path.basename(self.origfluxfile),fluxfile)
+            shutil.copyfile(self.origconffile,os.path.join(tmpdir,os.path.basename(self.origconffile)))
+            self.logger.info("  "+self.origconffile)
+            if (os.path.basename(self.origconffile) != conffile):
+                os.symlink(os.path.basename(self.origconffile),conffile)
+
 
         # Set local working filenames
         self.fluxfile = fluxfile
-        
+        self.conffile = conffile
+
         # Make final output directory
         if not os.path.exists(self.outdir):
             os.makedirs(self.outdir)   # will make multiple levels of directories if necessary
@@ -172,7 +189,7 @@ class Exposure:
 
 
     # Load chip
-    def loadchip(self,extension,fluxfile="flux.fits"):
+    def loadchip(self,extension,fluxfile="flux.fits",conffile="conf.fits"):
         # Load the data
         self.logger.info(" Loading chip "+str(extension))
         # Check that the working files set by "setup"
@@ -183,6 +200,7 @@ class Exposure:
             flux,fhead = fits.getdata(self.fluxfile,extension,header=True)
             fhead0 = fits.getheader(self.fluxfile,0)  # add PDU info
             fhead.extend(fhead0,unique=True)
+            conf,chead = fits.getdata(self.conffile,extension,header=True)
         except:
             self.logger.error("No extension "+str(extension))
             return(False)
@@ -190,8 +208,11 @@ class Exposure:
         if os.path.exists(fluxfile):
             os.remove(fluxfile)
         fits.writeto(fluxfile,flux,header=fhead,output_verify='warn')
+        if os.path.exists(conffile):
+            os.remove(conffile)
+        fits.writeto(conffile,conf,header=chead,output_verify='warn')
         # Create the chip object
-        self.chip = Chip(fluxfile,self.base,self.host)
+        self.chip = Chip(fluxfile,conffile,self.base,self.host)
         self.chip.bigextension = extension
         self.chip.version = self.version
         self.chip.outdir = self.outdir
@@ -295,8 +316,9 @@ def fixdecamheader(header):
 # Class to represent a single chip of an exposure
 class Chip:
 
-    def __init__(self,fluxfile,bigbase,host):
+    def __init__(self,fluxfile,conffile,bigbase,host):
         self.fluxfile = fluxfile
+        self.conffile = conffile
         self.bigbase = bigbase
         self.host = host
         if host=="tempest_katie" or host=="tempest_group": self.bindir = "/home/x25h971/bin/"
@@ -422,7 +444,7 @@ class Chip:
         # We have it already, just return it
         if self._pixscale is not None:
             return self._pixscale
-        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45 'uks': 0.20}
+        pixmap = { 'c4d': 0.27, 'k4m': 0.258, 'ksb': 0.45, 'uks': 0.20}
         try:
             pixscale = pixmap[self.instrument]
             self._pixscale = pixscale
@@ -573,9 +595,9 @@ class Chip:
             sexcatfile = "flux_sex"+str(self.sexiter)+".cat.fits"
             if self.sexcat is not None: offset=int(self.sexcat['NUMBER'][-1]) #ktedit:sex2
         #--------------------------------------------------------------------------------------------ktedit:sex2 B
-        basedir, tmpdir = utils.getnscdirs(self.version,self.host)
+        basedir, tmpdir = utils.getdirs(self.version,self.host)
         configdir = basedir+"config/"
-        sexcat, maglim = phot.runsex(infile,meta,sexcatfile,configdir,
+        sexcat, maglim = phot.runsex(infile,self.conffile,meta,sexcatfile,configdir,
                                      offset=offset,sexiter=self.sexiter,dthresh=dthresh,
                                      logger=self.logger,bindir=self.bindir) #ktedit:sex2
         #--------------------------------------------------------------------------------------------ktedit:sex2 T
@@ -652,7 +674,7 @@ class Chip:
         
     # Make image ready for DAOPHOT
     def mkdaoim(self):
-        phot.mkdaoim(self.fluxfile,self.meta,self.daofile,logger=self.logger)
+        phot.mkdaoim(self.fluxfile,self.conffile,self.meta,self.daofile,logger=self.logger)
 
     # DAOPHOT detection
     #----------------------
@@ -1031,7 +1053,7 @@ class Chip:
         self.logger.info("  Cleaning up")
         files1 = glob("flux*")
         files2 = glob("default*")
-        files = files1+files2+["flux.fits","daophot.opt","allstar.opt"]
+        files = files1+files2+["flux.fits","conf.fits","daophot.opt","allstar.opt"]
         for f in files:
             if os.path.exists(f): os.remove(f)
 
@@ -1045,6 +1067,7 @@ if __name__ == "__main__":
     # Initiate input arguments
     parser = ArgumentParser(description='Run NSC Instcal Measurement Process on one Exposure.')
     parser.add_argument('--fluxfile',type=str,nargs=1,help='Full path to fluxfile')
+    parser.add_argument('--conffile',type=str,nargs=1,help='Full path to confidence file')
     parser.add_argument('--version',type=str,nargs=1,default="None",help='Version number')
     parser.add_argument('--host',type=str,nargs=1,default="None",help='hostname, default "None", other options supported are "cca","tempest_katie","tempest_group","gp09/7"')
     parser.add_argument('--x',action='store_true', help='Exposure version is of format "vX"')
@@ -1062,7 +1085,7 @@ if __name__ == "__main__":
     print("version = ",version," host = ",host," x = ",x," redo = ",redo)
     
     # Get NSC directories
-    basedir, tmpdir = utils.getnscdirs(version,host)
+    basedir, tmpdir = utils.getdirs(version,host)
     print("Working in basedir,tmpdir = ",basedir,tmpdir)
     # Make sure the directories exist
     if not os.path.exists(basedir):
@@ -1072,8 +1095,7 @@ if __name__ == "__main__":
 
     # Get file names
     fluxfile = args.fluxfile[0]
-    wtfile = args.wtfile[0]
-    maskfile = args.maskfile[0]
+    conffile = args.conffile[0]
     # Check if file naming convention lists version "vX"
     if x:
         vers = fluxfile.split(".")[0].split("_")[-1]
@@ -1085,18 +1107,15 @@ if __name__ == "__main__":
     if os.path.exists(fluxfile) is False:
         print(fluxfile+" file NOT FOUND")
         sys.exit()
-    if os.path.exists(wtfile) is False:
-        print(wtfile+" file NOT FOUND")
-        sys.exit()
-    if os.path.exists(maskfile) is False:
-        print(maskfile+" file NOT FOUND")
+    if os.path.exists(conffile) is False:
+        print(conffile+" file NOT FOUND")
         sys.exit()
 
     # Start keeping time
     t0 = time.time()
     
     # Create the Exposure object
-    exp = Exposure(fluxfile,wtfile,maskfile,version=version,host=host)
+    exp = Exposure(fluxfile,conffile,version=version,host=host)
     # Run
     exp.run()
 
